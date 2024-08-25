@@ -1,0 +1,597 @@
+---
+title: "NYPD_shooting_incident"
+author: "Dalrae Jin"
+date: "2024-08-15"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(stringr)
+library(lubridate)
+library(readr)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(hms)
+```
+
+### 1. Importing Data
+
+I will start by reading in the dataset titled 'NYPD Shooting Incident Data (Historic)' from https://catalog.data.gov/dataset.
+
+```{r get_NYPD_data}
+url <- "https://data.cityofnewyork.us/api/views/833y-fsy8/rows.csv?accessType=DOWNLOAD"
+file_name <- "NYPD_Shooting_Incident_Data_Historic.csv"
+
+# Download the file
+temp_file <- tempfile(fileext = ".csv")
+download.file(url, temp_file, method = "curl")
+```
+
+Let's read in the data and see what we have.
+```{r import_data, message=FALSE}
+# Read the CSV file
+NYPD_shooting_incidents_data <- read.csv(temp_file)
+head(NYPD_shooting_incidents_data)
+```
+
+We are checking the number of rows and columns of the dataset.
+```{r shape_data}
+dim(NYPD_shooting_incidents_data)
+
+```
+
+There are 28562 rows and **21 columns** in `NYPD_shooting_incidents_data`.
+
+<br>
+<br>
+
+### 2. Tidying and Transforming Data
+
+After looking at `NYPD_shooting_incidents_data` briefly, I notice that there are too many columns in the dataset.
+
+Let's check out the names of the columns.
+```{r columns_names}
+colnames(NYPD_shooting_incidents_data)
+```
+
+Here are the columns I keep for the analysis and their description.
+
+* "INCIDENT_KEY" - Randomly generated persistent ID for each arrest
+* "OCCUR_DATE" - Exact date of the shooting incident
+* "OCCUR_TIME" - Exact time of the shooting incident
+* "BORO" - Borough where the shooting incident occurred
+* "STATISTICAL_MURDER_FLAG" - Shooting resulted in the victim’s death which would be counted as a murder
+* "PERP_AGE_GROUP" - Perpetrator’s age within a category
+* "PERP_SEX" - Perpetrator’s sex description
+* "PERP_RACE" - Perpetrator’s race description
+* "VIC_AGE_GROUP" - Victim’s age within a category
+* "VIC_SEX" - Victim’s sex description
+* "VIC_RACE" - Victim’s race description
+
+Now we select the columns that are chosen.
+```{r choose_cols}
+NYPD_shooting_incidents_data <- NYPD_shooting_incidents_data %>%
+  select(INCIDENT_KEY, OCCUR_DATE, OCCUR_TIME, BORO, STATISTICAL_MURDER_FLAG, 
+         PERP_AGE_GROUP, PERP_SEX, PERP_RACE, 
+         VIC_AGE_GROUP, VIC_SEX, VIC_RACE) 
+```
+
+Let's handle the missing data.
+First, check the number of missing values per column.
+
+```{r check_missing_data}
+# Run the missing value check again
+sapply(NYPD_shooting_incidents_data, function(x) sum(is.na(x) | x == "" | x == "(null)"))
+
+```
+
+And, change all "(null)" and empty strings with NA.
+```{r replace_empty_to_NA}
+# Replace "(null)" and empty strings with NA
+NYPD_shooting_incidents_data[NYPD_shooting_incidents_data == "(null)" | NYPD_shooting_incidents_data == ""] <- NA
+head(NYPD_shooting_incidents_data)
+```
+
+Second, let's change the datatype of some columns to analysis-friendly type.
+
+```{r datatype_convert}
+# Convert OCCUR_DATE to Date type
+NYPD_shooting_incidents_data <- NYPD_shooting_incidents_data %>%
+  mutate(OCCUR_DATE = as.Date(OCCUR_DATE, format = "%m/%d/%Y"))
+
+# Create a new column TIME_PERIOD based on OCCUR_TIME
+NYPD_shooting_incidents_data <- NYPD_shooting_incidents_data %>%
+  mutate(
+    OCCUR_TIME = hms::as_hms(OCCUR_TIME), # Convert OCCUR_TIME to time
+    TIME_PERIOD = case_when(
+      OCCUR_TIME >= hms::as_hms("00:00:00") & OCCUR_TIME < hms::as_hms("06:00:00") ~ "Night",
+      OCCUR_TIME >= hms::as_hms("06:00:00") & OCCUR_TIME < hms::as_hms("12:00:00") ~ "Morning",
+      OCCUR_TIME >= hms::as_hms("12:00:00") & OCCUR_TIME < hms::as_hms("18:00:00") ~ "Afternoon",
+      OCCUR_TIME >= hms::as_hms("18:00:00") & OCCUR_TIME < hms::as_hms("24:00:00") ~ "Evening"
+    )
+  )
+
+# Convert other columns to factors
+NYPD_shooting_incidents_data <- NYPD_shooting_incidents_data %>%
+  mutate(across(c(BORO, STATISTICAL_MURDER_FLAG, PERP_AGE_GROUP, PERP_SEX, PERP_RACE, 
+                  VIC_AGE_GROUP, VIC_SEX, VIC_RACE, TIME_PERIOD), as.factor))
+
+# Optional: Drop the original OCCUR_TIME column if you don't need it anymore
+# NYPD_shooting_incidents_data <- NYPD_shooting_incidents_data %>% select(-OCCUR_TIME)
+
+```
+
+```{r summary_NYPD_shooting_incidents_data}
+summary(NYPD_shooting_incidents_data)
+```
+
+Before we move forward, we should think about why there are so many NA in Perpetrator's data.
+
+```{r check_na_col}
+# Check the number of NA values in each column
+na_count <- colSums(is.na(NYPD_shooting_incidents_data))
+
+# Display the results
+print(na_count)
+```
+
+As we can see above, almost half of the data related to Perpetrator are `NA`.
+According to the 'NYPD_Shootings_Incident_Level_Data_Footnotes' documents uploaded on the same website, 
+
+ *"Null values appearing frequently in certain
+fields may be attributed to changes on official department forms where data was
+previously not collected. Null values may also appear in instances where
+information was not available or unknown at the time of the report and should be
+considered as either “Unknown/Not Available/Not Reported.” "*
+
+
+I'd like to separate the dataset into `NYPD_perp_vic` (rows where perp info is not NA), `NYPD_only_vic` (rows where perp info is NA, and vic info is not NA).
+
+```{r separate_dateset}
+
+# Create the 'NYPD_perp_vic' dataset (rows where perpetrator info is not NA)
+NYPD_perp_vic <- NYPD_shooting_incidents_data %>%
+  filter(!is.na(PERP_AGE_GROUP) & !is.na(PERP_SEX) & !is.na(PERP_RACE))
+
+# Create the 'NYPD_only_vic' dataset (rows where perpetrator info is NA, but victim info is not NA)
+NYPD_only_vic <- NYPD_shooting_incidents_data %>%
+  filter(is.na(PERP_AGE_GROUP) & is.na(PERP_SEX) & is.na(PERP_RACE) & 
+         !is.na(VIC_AGE_GROUP) & !is.na(VIC_SEX) & !is.na(VIC_RACE))
+
+```
+
+Let's check the size of the new datasets.
+```{r dataset_size}
+print(dim(NYPD_perp_vic))
+print(dim(NYPD_only_vic))
+
+```
+
+
+<br>
+<br>
+
+### 3. Visualizing Data
+
+Let's explore the data with visualizations.
+
+#### 3-1. Number of Incidents by Date
+
+```{r plot_incidents_by_date}
+# Plot the number of incidents by date
+ggplot(NYPD_shooting_incidents_data, aes(x = OCCUR_DATE)) +
+  geom_bar() +
+  labs(title = "Number of Incidents by Date", x = "Date", y = "Number of Incidents") +
+  theme_minimal()
+```
+
+<br>
+
+#### 3-2. Number of Incidents by Time Period and Borough
+
+```{r plot_incidents_by_time_boro}
+# Plot the number of incidents by time period and borough
+ggplot(NYPD_shooting_incidents_data, aes(x = TIME_PERIOD, fill = BORO)) +
+  geom_bar(position = "dodge") +
+  labs(title = "Number of Incidents by Time Period and Borough", x = "Time Period", y = "Number of Incidents", fill = "Borough") +
+  theme_minimal()
+```
+
+<br>
+
+#### 3-3. Number of Incidents by Victim Age Group and Perpetrator Age Group
+
+```{r plot_vic_perp_age}
+# Plot the number of incidents by victim age group and perpetrator age group
+ggplot(NYPD_shooting_incidents_data, aes(x = VIC_AGE_GROUP, fill = PERP_AGE_GROUP)) +
+  geom_bar(position = "dodge") +
+  labs(title = "Number of Incidents by Victim and Perpetrator Age Group", x = "Victim Age Group", y = "Number of Incidents", fill = "Perpetrator Age Group") +
+  theme_minimal()
+```
+
+As we can see from the plot above, there are some values that does not make sense for am age group. Let's trim the dataset again.
+
+```{r trim_age_group}
+# Define the incorrect values for victim and perpetrator age groups
+incorrect_age_groups <- c('1022', '1020', '1028', '224', '940')
+
+# Filter out the incorrect values from NYPD_shooting_incidents_data
+NYPD_shooting_incidents_data <- NYPD_shooting_incidents_data %>%
+  filter(!VIC_AGE_GROUP %in% incorrect_age_groups & !PERP_AGE_GROUP %in% incorrect_age_groups)
+
+# Filter out the incorrect values from NYPD_perp_vic
+NYPD_perp_vic <- NYPD_perp_vic %>%
+  filter(!VIC_AGE_GROUP %in% incorrect_age_groups & !PERP_AGE_GROUP %in% incorrect_age_groups)
+
+# Filter out the incorrect values from NYPD_only_vic
+NYPD_only_vic <- NYPD_only_vic %>%
+  filter(!VIC_AGE_GROUP %in% incorrect_age_groups)
+
+```
+
+Let's plot age group one more time, but with `NYPD_perp_vic` data.
+
+```{r plot_vic_perp_age_2}
+# Plot the number of incidents by victim age group and perpetrator age group
+ggplot(NYPD_perp_vic, aes(x = VIC_AGE_GROUP, fill = PERP_AGE_GROUP)) +
+  geom_bar(position = "dodge") +
+  labs(title = "Number of Incidents by Victim and Perpetrator Age Group", x = "Victim Age Group", y = "Number of Incidents", fill = "Perpetrator Age Group") +
+  theme_minimal()
+```
+
+<br>
+
+#### 3-4. Number of Incidents by Victim Sex and Perpetrator Sex
+
+This time, I use `NYPD_perp_vic` data.
+
+```{r plot_sex}
+# Plot the number of incidents by victim sex and perpetrator sex
+ggplot(NYPD_perp_vic, aes(x = VIC_SEX, fill = PERP_SEX)) +
+  geom_bar(position = "dodge") +
+  labs(title = "Number of Incidents by Victim and Perpetrator Sex", x = "Victim Sex", y = "Number of Incidents", fill = "Perpetrator Sex") +
+  theme_minimal()
+
+```
+
+<br>
+
+#### 3-5. Number of Incidents by Victim Race and Perpetrator Race
+
+```{r plot_race}
+
+ggplot(NYPD_perp_vic, aes(x = VIC_RACE, fill = PERP_RACE)) +
+  geom_bar(position = "dodge") +
+  labs(title = "Number of Incidents by Victim and Perpetrator Race", x = "Victim Race", y = "Number of Incidents", fill = "Perpetrator Race") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+<br>
+<br>
+
+### 4. Analyzing Data
+
+After plotting the datasets, the visualizations lead us to some questions.
+From the visualization 3-1, it seems like there are some patterns of the incidents and its occurred date (or month). Does a pattern actually exist?
+
+Also, Are there any relation among features(columns)? For example, location and time period, perpetrator and victim, or perpetrator and location, etc.
+
+<br>
+
+#### 4-1. Analyze Patterns in Incidents Over Time
+
+```{r analyze_pattern_over_time}
+# Aggregate incidents by month
+NYPD_shooting_incidents_data$Month <- format(NYPD_shooting_incidents_data$OCCUR_DATE, "%Y-%m")
+
+# New dataset
+monthly_incidents <- NYPD_shooting_incidents_data %>%
+  group_by(Month) %>%
+  summarise(Incidents = n())
+
+# Ensure that Month is treated as a Date or factor with ordered levels
+monthly_incidents$Month <- as.Date(paste0(monthly_incidents$Month, "-01"))
+
+# Create a new column for text color based on the number of incidents
+monthly_incidents <- monthly_incidents %>%
+  mutate(Text_Color = case_when(
+    Incidents > 200 ~ "red",
+    Incidents < 100 ~ "blue",
+    TRUE ~ "black"  # Default color if not meeting the conditions
+  ))
+
+# Plot incidents by month
+ggplot(monthly_incidents, aes(x = Month, y = Incidents, group = 1)) +
+  geom_line() +
+  geom_point() +
+  geom_text(aes(label = format(Month, "%b"), color = Text_Color), vjust = -0.5, hjust = 0.5, size = 3) +
+  scale_color_identity() +  # Use the colors defined in Text_Color
+  scale_x_date(date_labels = "%Y", date_breaks = "12 month") +
+  labs(title = "Monthly Number of Incidents", x = "Month", y = "Number of Incidents") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+This is the time series by month and year. Red color indicates that the number of incidents is over 200,  and blue color indicates that the number of incidents is below 100.
+
+The time series plot reveals clear trends, including seasonal patterns. Specifically, the months with fewer than 100 incidents (shown in blue) are November, December, January, February, and March, indicating lower incident rates in the winter. Conversely, the months with over 200 incidents (shown in red) are June, July, and August, highlighting a peak in incidents during the summer. Between 2017 and 2019, the number of incidents was generally below 100 throughout the year, with February consistently having the fewest incidents and July the most. This observation of higher summer incidents and lower winter incidents supports the overall trend.
+
+<br>
+
+#### 4-2. Analyze Relationships Among Features
+
+Let's find out if there is a relationship between features.
+
+**(1) Location and Time Period**
+
+```{r location_time_relation}
+# Cross-tabulation
+location_time_table <- table(NYPD_shooting_incidents_data$BORO, NYPD_shooting_incidents_data$TIME_PERIOD)
+
+# Chi-Square Test
+chi_sq_location_time <- chisq.test(location_time_table)
+
+print(chi_sq_location_time)
+
+```
+
+**(2) Perpetrator and Victim Relationships**
+
+```{r perp_vic_relation, warning=FALSE}
+# Cross-tabulation of victim and perpetrator sex
+vic_perp_sex_table <- table(NYPD_perp_vic$PERP_SEX, NYPD_perp_vic$VIC_SEX)
+
+# Chi-Square Test
+chi_sq_vic_perp_sex <- chisq.test(vic_perp_sex_table)
+
+print("Chi_Square Test on Perpetrator and Victim's SEX")
+print(chi_sq_vic_perp_sex)
+
+# Cross-tabulation of victim and perpetrator race
+vic_perp_race_table <- table(NYPD_perp_vic$PERP_RACE, NYPD_perp_vic$VIC_RACE)
+
+# Chi-Square Test
+chi_sq_vic_perp_race <- chisq.test(vic_perp_race_table)
+
+print("Chi_Square Test on Perpetrator and Victim's RACE")
+print(chi_sq_vic_perp_race)
+```
+
+The Chi-Square test shows strong associations between the sex and race of perpetrators and victims with very low p-values, indicating significant relationships.
+
+<br>
+
+#### 4-3. Analysis shooting incidents by death
+
+Let's examine the number of shooting victims who survived, categorized by the victim's sex. I will calculate the proportion of deceased and surviving victims for each sex.
+
+```{r analyze_death_vic_sex}
+# Calculate the total number of incidents per sex
+total_counts <- NYPD_shooting_incidents_data %>%
+  group_by(VIC_SEX) %>%
+  summarise(total = n())
+
+# Calculate counts and percentages per sex and death status
+data_for_plot <- NYPD_shooting_incidents_data %>%
+  group_by(VIC_SEX, STATISTICAL_MURDER_FLAG) %>%
+  summarise(count = n()) %>%
+  left_join(total_counts, by = "VIC_SEX") %>%
+  mutate(percentage = (count / total) * 100)
+
+# Create the plot with percentages
+ggplot(data_for_plot, aes(x = VIC_SEX, y = count, fill = STATISTICAL_MURDER_FLAG)) +
+  geom_bar(position = "dodge", stat = "identity") +
+  geom_text(aes(label = paste0(round(percentage, 1), "%")), 
+            position = position_dodge(width = 0.9), 
+            vjust = -0.5) +
+  labs(
+    title = "Number of Shooting Incidents by Victim Sex and Death Status",
+    x = "Victim Sex",
+    y = "Number of Incidents",
+    fill = "Death Status"
+  ) +
+  theme_minimal()
+```
+
+It turns out that there are significantly more male victims than female victims. However, the survival rates are nearly the same: the survival rate for female victims is 79.8%, while for male victims, it is 80.7%.
+
+
+We've been exploring the data and trying to identify trends or relationships among the features. This leads us to another question: Can we predict the unknown perpetrator's information (sex, age, race) by modeling the data? Let's find out.
+
+<br>
+<br>
+
+### 5. Modeling Data
+
+#### 5-1. Predict Perpetrator's sex
+
+To predict the perpetrator's sex, I am going to use logistic regression. Logistic regression is a classification method that can predict a binary qualitative response. Therefore, I need to remove the rows where the perpetrator's or victim's sex is labeled as "U" (Unknown).
+
+```{r remove_U_from_sex}
+# Remove rows where PERP_SEX or VIC_SEX is "U"
+NYPD_perp_vic_bi_sex <- NYPD_perp_vic[!(NYPD_perp_vic$PERP_SEX == "U" | NYPD_perp_vic$VIC_SEX == "U"), ]
+```
+
+Before modeling the data, let's split `NYPD_perp_vic_bi_sex` into a training and test set.
+
+```{r split_tr_te}
+# Set seed for reproducibility
+set.seed(123)
+
+# Sample 80% of the data for training
+trainIndex <- sample(seq_len(nrow(NYPD_perp_vic_bi_sex)), size = 0.8 * nrow(NYPD_perp_vic_bi_sex))
+
+# Create training and test datasets
+NYPD_train <- NYPD_perp_vic_bi_sex[trainIndex, ]
+NYPD_test <- NYPD_perp_vic_bi_sex[-trainIndex, ]
+
+```
+
+
+I tried adding different predictors to find the best model.
+
+```{r logistic_reg}
+# Logistic Regression for binary classification (e.g., PERP_SEX)
+model_logistic_1 <- glm(PERP_SEX ~ VIC_SEX, data = NYPD_train, family = binomial)
+summary(model_logistic_1)
+
+model_logistic_2 <- glm(PERP_SEX ~ VIC_SEX + VIC_RACE, data = NYPD_train, family = binomial)
+summary(model_logistic_2)
+```
+
+*Disclaimer: I actually tried adding other predictors; however, they were not significant. Therefore, I compared the two models above, which contain statistically significant coefficients.*
+
+<br>
+
+**Model Comparison**
+
+* Lower AIC is better. However, AIC of *Model 1* and *Model 2* is about the same (3409.6 vs. 3409), which suggests that both models perform similarly.
+
+* In *Model 1*, the predictor VIC_SEX is significant with a p-value of 2.18e-05. In *Model 2*, the predictor VIC_SEX remains significant with a p-value of 4.33e-05, but other variables like VIC_RACE categories also show varying degrees of significance. However, some race categories, like VIC_RACEUNKNOWN, are not significant, which could suggest that adding these variables doesn't substantially improve the model.
+
+Given these factors, *Model 1* may be the better choice due to its simplicity and significant coefficients. Besides, for predicting the sex of perpetrator, I do not think that adding victim's race variable is necessary. Therefore, I chose the model 1.
+
+
+```{r make_pred_log_reg}
+# Choose the best fit model
+model_logistic <- model_logistic_1
+
+# Make predictions
+logistic_predictions <- predict(model_logistic, newdata = NYPD_test, type = "response")
+logistic_pred_class <- ifelse(logistic_predictions > 0.5, "M", "F")  
+
+# calculate accuracy
+accuracy_sex <- mean(logistic_pred_class == NYPD_test$PERP_SEX)
+print(accuracy_sex)
+
+```
+
+Using the logistic regression model (`model_logistic_1`), we can predict the perpetrator's sex with approximately 98% accuracy.
+
+<br>
+
+#### 5-2. Predict Perpetrator's Age Group
+
+Before modeling the data, I need to remove "UNKNOWN" from perpetrator and victim's age group. And, only keep the valid age group values. Because we cannot have 0 instances for random forest model. Let's remove them.
+
+```{r remove_unknown_age}
+# Remove rows where PERP_AGE_GROUP or VIC_AGE_GROUP is "UNKNOWN"
+NYPD_perp_vic_age <- NYPD_perp_vic[!(NYPD_perp_vic$PERP_AGE_GROUP == "UNKNOWN" | NYPD_perp_vic$VIC_AGE_GROUP == "UNKNOWN"), ]
+
+# Define the valid age groups
+valid_age_groups <- c('<18', '18-24', '25-44', '45-64', '65+')
+
+# Trim whitespace from age group columns
+NYPD_perp_vic_age$PERP_AGE_GROUP <- trimws(NYPD_perp_vic_age$PERP_AGE_GROUP)
+NYPD_perp_vic_age$VIC_AGE_GROUP <- trimws(NYPD_perp_vic_age$VIC_AGE_GROUP)
+
+# Filter the data to only keep rows with valid age groups
+NYPD_perp_vic_age <- NYPD_perp_vic_age[
+  NYPD_perp_vic_age$PERP_AGE_GROUP %in% valid_age_groups &
+  NYPD_perp_vic_age$VIC_AGE_GROUP %in% valid_age_groups, 
+]
+```
+
+And then, we split the dataset into training and test data.
+
+```{r split_age_data}
+# Set seed for reproducibility
+set.seed(123)
+
+# Sample 80% of the data for training
+trainIndex <- sample(seq_len(nrow(NYPD_perp_vic_age)), size = 0.8 * nrow(NYPD_perp_vic_age))
+
+# Create training and test datasets
+NYPD_train_age <- NYPD_perp_vic_age[trainIndex, ]
+NYPD_test_age <- NYPD_perp_vic_age[-trainIndex, ]
+```
+
+There are so many different methods for modeling multi-class classification, I chose Random Forest method for high performance. Although Logistic Regression with Multinomial Outcome is good method, it may not perform well with complex relationships or high-dimensional data.
+
+
+Let's check the values of age group.
+```{r age_group_value_before}
+table(NYPD_train_age$PERP_AGE_GROUP)
+table(NYPD_train_age$VIC_AGE_GROUP)
+table(NYPD_test_age$PERP_AGE_GROUP)
+table(NYPD_test_age$VIC_AGE_GROUP)
+```
+
+Make sure the data type of age group is factor.
+```{r data_type_factor}
+# Convert response variable to factor if it's not already
+NYPD_train_age$PERP_AGE_GROUP <- as.factor(NYPD_train_age$PERP_AGE_GROUP)
+NYPD_test_age$PERP_AGE_GROUP <- as.factor(NYPD_test_age$PERP_AGE_GROUP)
+NYPD_train_age$VIC_AGE_GROUP <- as.factor(NYPD_train_age$VIC_AGE_GROUP)
+NYPD_test_age$VIC_AGE_GROUP <- as.factor(NYPD_test_age$VIC_AGE_GROUP)
+```
+
+Now, let's model the training data using random forest.
+
+```{r rf_modeling, warning=FALSE}
+# Install and load the randomForest package
+# install.packages("randomForest")
+library(randomForest)
+
+# Fit the random forest model
+model_rf <- randomForest(PERP_AGE_GROUP ~ ., data = NYPD_train_age)
+
+# Make predictions
+rf_predictions <- predict(model_rf, newdata = NYPD_test_age)
+```
+
+Now we evaluate the model.
+
+```{r eval_rf_cm}
+# Create a confusion matrix manually
+conf_matrix <- table(Predicted = rf_predictions, Actual = NYPD_test_age$PERP_AGE_GROUP)
+
+# Print the confusion matrix
+print(conf_matrix)
+
+# Total number of observations
+total <- sum(conf_matrix)
+
+# Number of correct predictions
+correct <- sum(diag(conf_matrix))
+
+# Accuracy
+accuracy_age <- correct / total
+print(paste("Accuracy:", round(accuracy_age * 100, 2), "%"))
+
+```
+
+**Model Evaluation - Random Forest**
+
+The evaluation of the Random Forest model for predicting the perpetrator’s age group yields an overall accuracy of 50.37%. The confusion matrix reveals that the model struggles particularly with predicting the age groups '<18' and '45-64', while it performs relatively better for the '18-24' and '25-44' groups.
+
+Given the model’s performance, it appears that Random Forest may not be the most effective choice for predicting age groups in this dataset. The relatively low accuracy and difficulties with certain age groups suggest that the model could benefit from additional domain knowledge or a more comprehensive dataset to improve its predictive power. Further investigation and refinement are needed to enhance the model's performance and reliability.
+
+<br>
+<br>
+
+### 6. Conclusion and Sources of Bias
+
+**Conclusion**
+
+In this analysis, various modeling techniques were employed to predict the perpetrator's sex and age group using the NYPD shooting incidents data. The logistic regression model achieved a high accuracy of 98% in predicting the perpetrator's sex, indicating its effectiveness in classifying sex based on the available features.
+
+In contrast, the Random Forest model for predicting the perpetrator’s age group yielded an accuracy of approximately 50.37%. The model’s performance was notably weak for the '<18' and '45-64' age groups, suggesting that Random Forest may not be the most appropriate model for this task. This limitation underscores the need for further exploration, potentially incorporating additional domain knowledge or supplementary data to enhance predictive accuracy.
+
+**Sources of Bias**
+
+In analyzing the NYPD shooting incidents data, I observed that certain groups, such as different races and age groups, were not evenly represented. This imbalance can lead to biased results, especially when predicting characteristics like the perpetrator's sex and age group.
+
+To address this, I carefully considered which features to include in my models. For example, when predicting the perpetrator’s sex, I chose not to use the victim’s race as a feature. I didn’t see a clear connection between these variables, and including the victim’s race might have skewed the results due to the existing data imbalances.
+
+I also took into account potential bias from model selection. Different models have varying assumptions and strengths, which can impact the results. I tested several models and features and decided to drop one that didn’t perform well. For predicting the perpetrator’s age group, I found that Random Forest provided better results compared to logistic regression with multi-class classification.
+
+I’m aware that my personal biases could influence the feature selection and model choices. To minimize this, I ensured a thorough evaluation of different options, carefully analyzed the data, and avoided including features that could introduce bias.
+
+
